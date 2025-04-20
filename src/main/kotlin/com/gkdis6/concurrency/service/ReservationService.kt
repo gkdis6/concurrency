@@ -49,4 +49,23 @@ class ReservationService(
         // 4. Save the reservation record to the database.
         return reservationRepository.save(reservation)
     }
+
+    /**
+     * [비관적 락] 비관적 락을 사용하여 좌석 예약 시도
+     */
+    @Transactional
+    fun reserveSeatWithPessimisticLock(seatId: Long, userId: String): Reservation {
+        // 1. Find the seat using Pessimistic Lock
+        val seat = seatRepository.findByIdWithPessimisticLock(seatId) // Use the locking method
+            .orElseThrow { NoSuchElementException("해당 좌석을 찾을 수 없습니다. ID: $seatId") }
+
+        // 2. Check availability and mark as reserved. (Protected by lock)
+        seat.reserve()
+
+        // 3. Create the reservation record.
+        val reservation = Reservation(seat = seat, userId = userId)
+
+        // 4. Save the reservation record.
+        return reservationRepository.save(reservation)
+    }
 } 

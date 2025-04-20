@@ -67,90 +67,149 @@ class ReservationServiceConcurrencyTest {
     }
 
     @Test
-    @DisplayName("동시에 100개의 요청으로 같은 좌석 예약을 시도하면, 동시성 제어 없이는 여러 건 예약 성공(문제 발생)")
-    fun `reserveSeat_concurrency_no_control_should_fail`() {
-        val numberOfThreads = 100 // Number of concurrent requests simulation
-        val threadPoolSize = 32 // Size of the thread pool managing execution
+    @DisplayName("[문제 재현] 동시성 제어 없이 예약 시도 시 DB 제약조건 위반 발생")
+    fun `reserveSeat_concurrency_no_control_should_fail_on_db_constraint`() {
+        val numberOfThreads = 100
+        val threadPoolSize = 32
         val executorService = Executors.newFixedThreadPool(threadPoolSize)
-        val latch = CountDownLatch(numberOfThreads) // Coordinate thread completion
-        val successfulReservations = AtomicInteger(0) // Thread-safe counter for successes
-        val failedDueToConflict = AtomicInteger(0) // Thread-safe counter for known conflicts (e.g., already reserved)
+        val latch = CountDownLatch(numberOfThreads)
+        val successfulReservations = AtomicInteger(0)
+        val failedDueToConflict = AtomicInteger(0)
         val failedDueToDbConstraint = AtomicInteger(0) // Counter for DataIntegrityViolationException
-        val otherFailures = AtomicInteger(0) // Counter for unexpected errors
+        val otherFailures = AtomicInteger(0)
 
-        log.info("--- [TEST START] Concurrency test for Seat ID: {} ---", testSeatId)
+        log.info("--- [TEST START - No Lock] Concurrency test for Seat ID: {} ---", testSeatId)
 
-        // Submit tasks for each simulated user request
         for (i in 1..numberOfThreads) {
             executorService.submit {
                 val userId = "user-$i"
                 try {
-                    log.info("Attempting reservation for {} on Seat {}", userId, testSeatId)
-                    // Attempt to reserve the seat
-                    reservationService.reserveSeat(testSeatId, userId)
-                    // If reserveSeat completes without exception, increment success counter
+                    log.info("[No Lock] Attempting reservation for {} on Seat {}", userId, testSeatId)
+                    reservationService.reserveSeat(testSeatId, userId) // 기존 메소드 호출
                     successfulReservations.incrementAndGet()
-                    log.info("SUCCESS for {}", userId)
+                    log.info("[No Lock] SUCCESS for {}", userId)
                 } catch (e: IllegalStateException) {
-                    // Catch the specific exception thrown when the seat is already reserved
-                    log.warn("FAILED for {} (Conflict - Already Reserved): {}", userId, e.message)
+                    log.warn("[No Lock] FAILED for {} (Conflict - Already Reserved): {}", userId, e.message)
                     failedDueToConflict.incrementAndGet()
                 } catch (e: DataIntegrityViolationException) {
-                    // Database unique constraint violation - indicates race condition occurred
-                    log.error("FAILED for {} (DB Constraint Violation): {}", userId, e.message) // Log as ERROR as it's a key issue
+                    log.error("[No Lock] FAILED for {} (DB Constraint Violation): {}", userId, e.message)
                     failedDueToDbConstraint.incrementAndGet()
                 } catch (e: Exception) {
-                    // Catch any other unexpected exceptions during the process
-                    log.error("FAILED for {} (Other): {}", userId, e.javaClass.simpleName, e)
+                    log.error("[No Lock] FAILED for {} (Other): {}", userId, e.javaClass.simpleName, e)
                     otherFailures.incrementAndGet()
                 } finally {
-                    latch.countDown() // Signal that this thread has finished its attempt
+                    latch.countDown()
                 }
             }
         }
 
-        latch.await() // Wait for all threads to complete their execution
-        executorService.shutdown() // Shut down the executor service
+        latch.await()
+        executorService.shutdown()
 
-        log.info("--- [TEST END] Concurrency Test Finished ---")
-        log.info("--- Results ---:")
+        log.info("--- [TEST END - No Lock] Concurrency Test Finished ---")
+        log.info("--- [No Lock] Results ---:")
         log.info("  Successes                     : {}", successfulReservations.get())
         log.info("  Failures (Conflict)           : {}", failedDueToConflict.get())
-        log.info("  Failures (DB Constraint)      : {}", failedDueToDbConstraint.get()) // Log the new counter
+        log.info("  Failures (DB Constraint)      : {}", failedDueToDbConstraint.get())
         log.info("  Failures (Other)            : {}", otherFailures.get())
 
-        // Verification: Check the final state in the database
         val finalSeat = seatRepository.findById(testSeatId).orElseThrow()
         val reservationsInDb = reservationRepository.findAll().filter { it.seat.id == testSeatId }
 
-        log.info("--- Final DB State ---:")
+        log.info("--- [No Lock] Final DB State ---:")
         log.info("  Seat ID {} Reserved Status : {}", testSeatId, finalSeat.reserved)
         log.info("  Reservations in DB for Seat {}: {}", testSeatId, reservationsInDb.size)
 
-        // Assertions:
-        // Without concurrency control, multiple threads might read 'reserved = false'
-        // before any thread can commit the change 'reserved = true'.
-        // This leads to a race condition.
-
-        // Ideally, only ONE reservation should succeed.
-        // THIS ASSERTION IS EXPECTED TO FAIL in this version without locks.
+        // Assertions: Expect DB constraint violations
         assertThat(successfulReservations.get())
-            .withFailMessage("성공한 예약은 정확히 1개여야 하지만 ${successfulReservations.get()}개 입니다.")
-            .isEqualTo(1)
-
-        // Consequently, only ONE reservation record should exist in the database for this seat.
-        // THIS ASSERTION IS ALSO EXPECTED TO FAIL.
+            .withFailMessage("[No Lock] 성공한 예약은 정확히 1개여야 하지만 DB 제약조건 덕분에 1개가 될 수 있음 (과정 확인 필요)")
+            .isEqualTo(1) // DB 제약 때문에 결과는 1일 수 있음
         assertThat(reservationsInDb.size)
-            .withFailMessage("DB에 저장된 예약은 정확히 1개여야 하지만 ${reservationsInDb.size}개 입니다.")
-            .isEqualTo(1)
-
-        // The final state of the seat should be 'reserved = true'.
-        // This might pass by chance if at least one reservation succeeded, but doesn't guarantee correctness.
+             .withFailMessage("[No Lock] DB에 저장된 예약은 정확히 1개여야 하지만 ${reservationsInDb.size}개 입니다.")
+             .isEqualTo(1)
         assertThat(finalSeat.reserved).isTrue()
-
-        // Crucially, assert that the race condition DID occur (as expected in this test)
         assertThat(failedDueToDbConstraint.get())
-             .withFailMessage("DB 제약조건 위반 실패가 발생해야 하지만, 발생하지 않았습니다. (테스트 환경 확인 필요)")
-             .isGreaterThan(0)
+             .withFailMessage("[No Lock] DB 제약조건 위반 실패가 발생해야 하지만, 발생하지 않았습니다.")
+             .isGreaterThan(0) // << 핵심: DB 제약 조건 위반이 발생하는지 확인
+    }
+
+
+    @Test
+    @DisplayName("[비관적 락] 동시 예약 시도 시 1건만 성공하고 DB 제약조건 위반 없음")
+    fun `reserveSeat_concurrency_pessimistic_lock_should_succeed`() {
+        val numberOfThreads = 100
+        val threadPoolSize = 32
+        val executorService = Executors.newFixedThreadPool(threadPoolSize)
+        val latch = CountDownLatch(numberOfThreads)
+        val successfulReservations = AtomicInteger(0)
+        val failedDueToConflict = AtomicInteger(0)       // IllegalStateException counter
+        val failedDueToDbConstraint = AtomicInteger(0)    // DataIntegrityViolationException counter
+        val failedDueToLocking = AtomicInteger(0)       // PessimisticLockingFailureException counter
+        val otherFailures = AtomicInteger(0)
+
+        log.info("--- [TEST START - Pessimistic Lock] Concurrency test for Seat ID: {} ---", testSeatId)
+
+        for (i in 1..numberOfThreads) {
+            executorService.submit {
+                val userId = "user-lock-$i" // Use different user ID prefix for clarity
+                try {
+                    log.info("[Pessimistic Lock] Attempting reservation for {} on Seat {}", userId, testSeatId)
+                    reservationService.reserveSeatWithPessimisticLock(testSeatId, userId) // 비관적 락 메소드 호출
+                    successfulReservations.incrementAndGet()
+                    log.info("[Pessimistic Lock] SUCCESS for {}", userId)
+                } catch (e: IllegalStateException) {
+                    // This should now be the primary failure reason for concurrent attempts after the first success
+                    log.warn("[Pessimistic Lock] FAILED for {} (Conflict - Already Reserved): {}", userId, e.message)
+                    failedDueToConflict.incrementAndGet()
+                } catch (e: DataIntegrityViolationException) {
+                    // This should NOT happen with pessimistic locking
+                    log.error("[Pessimistic Lock] FAILED for {} (DB Constraint Violation - UNEXPECTED): {}", userId, e.message)
+                    failedDueToDbConstraint.incrementAndGet()
+                } catch (e: PessimisticLockingFailureException) {
+                    // Could happen if lock acquisition times out (less likely with H2 default settings)
+                    log.error("[Pessimistic Lock] FAILED for {} (Lock Acquisition Failure): {}", userId, e.message)
+                    failedDueToLocking.incrementAndGet()
+                }
+                catch (e: Exception) {
+                    log.error("[Pessimistic Lock] FAILED for {} (Other): {}", userId, e.javaClass.simpleName, e)
+                    otherFailures.incrementAndGet()
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+
+        latch.await()
+        executorService.shutdown()
+
+        log.info("--- [TEST END - Pessimistic Lock] Concurrency Test Finished ---")
+        log.info("--- [Pessimistic Lock] Results ---:")
+        log.info("  Successes                     : {}", successfulReservations.get())
+        log.info("  Failures (Conflict)           : {}", failedDueToConflict.get())
+        log.info("  Failures (DB Constraint)      : {}", failedDueToDbConstraint.get()) // Should be 0
+        log.info("  Failures (Locking)          : {}", failedDueToLocking.get())     // Likely 0
+        log.info("  Failures (Other)            : {}", otherFailures.get())
+
+        val finalSeat = seatRepository.findById(testSeatId).orElseThrow()
+        val reservationsInDb = reservationRepository.findAll().filter { it.seat.id == testSeatId }
+
+        log.info("--- [Pessimistic Lock] Final DB State ---:")
+        log.info("  Seat ID {} Reserved Status : {}", testSeatId, finalSeat.reserved)
+        log.info("  Reservations in DB for Seat {}: {}", testSeatId, reservationsInDb.size)
+
+        // Assertions: Expect exactly 1 success and NO DB constraint violations
+        assertThat(successfulReservations.get())
+            .withFailMessage("[Pessimistic Lock] 성공한 예약은 정확히 1개여야 합니다.")
+            .isEqualTo(1)
+        assertThat(reservationsInDb.size)
+            .withFailMessage("[Pessimistic Lock] DB에 저장된 예약은 정확히 1개여야 합니다.")
+            .isEqualTo(1)
+        assertThat(finalSeat.reserved).isTrue()
+        assertThat(failedDueToDbConstraint.get())
+            .withFailMessage("[Pessimistic Lock] DB 제약조건 위반 실패는 발생하지 않아야 합니다.")
+            .isEqualTo(0) // << 핵심: DB 제약 조건 위반이 없는지 확인
+        assertThat(failedDueToLocking.get())
+            .withFailMessage("[Pessimistic Lock] 락 획득 실패는 발생하지 않아야 합니다 (테스트 환경 확인 필요).")
+            .isEqualTo(0) // PESSIMISTIC_WRITE는 보통 대기하므로 타임아웃이 없다면 0
     }
 } 
