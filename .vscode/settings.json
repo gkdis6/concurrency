@@ -1,0 +1,4 @@
+{
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "kotlin.compiler.jvm.target": "17"
+}
