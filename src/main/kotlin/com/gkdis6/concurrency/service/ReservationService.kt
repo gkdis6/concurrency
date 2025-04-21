@@ -1,16 +1,21 @@
 package com.gkdis6.concurrency.service
 
 import com.gkdis6.concurrency.domain.Reservation
+import com.gkdis6.concurrency.domain.SeatWithVersion
+import com.gkdis6.concurrency.domain.SeatWithoutVersion
 import com.gkdis6.concurrency.repository.ReservationRepository
-import com.gkdis6.concurrency.repository.SeatRepository
+import com.gkdis6.concurrency.repository.SeatWithVersionRepository
+import com.gkdis6.concurrency.repository.SeatWithoutVersionRepository
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import java.time.LocalDateTime
 import java.util.NoSuchElementException
 
 @Service
 class ReservationService(
-    // Constructor injection for repositories
-    private val seatRepository: SeatRepository,
+    // Inject new repositories
+    private val seatWithVersionRepository: SeatWithVersionRepository,
+    private val seatWithoutVersionRepository: SeatWithoutVersionRepository,
     private val reservationRepository: ReservationRepository
 ) {
 
@@ -24,29 +29,21 @@ class ReservationService(
      * @throws NoSuchElementException if the seat with the given ID is not found.
      * @throws IllegalStateException if the seat is already reserved.
      */
-    @Transactional // Ensures atomicity: either all operations succeed, or none do.
+    @Transactional
     fun reserveSeat(seatId: Long, userId: String): Reservation {
-        // 1. Find the seat by ID. Throw an exception if not found.
-        val seat = seatRepository.findById(seatId)
-            .orElseThrow { NoSuchElementException("해당 좌석을 찾을 수 없습니다. ID: $seatId") }
+        // This method now handles the Optimistic Lock case using SeatWithVersion
+        val seat = seatWithVersionRepository.findById(seatId)
+            .orElseThrow { NoSuchElementException("Seat not found with ID: $seatId") }
 
-        // 2. Check availability and mark as reserved within the Seat entity.
-        // This throws IllegalStateException if seat.reserved is already true.
+        // reserve() method in SeatWithVersion includes version in exception message
         seat.reserve()
+        // seatWithVersionRepository.save(seat) // Save is cascaded from Reservation or handled by dirty checking
 
-        // Note: JPA's dirty checking mechanism within a @Transactional context
-        // will automatically detect the change in the 'seat.reserved' state
-        // and generate an UPDATE SQL statement upon transaction commit.
-        // Explicitly calling seatRepository.save(seat) is usually not needed here.
-
-        // 3. Create the reservation record.
         val reservation = Reservation(
-            seat = seat,
-            userId = userId
-            // reservationTime is set automatically by the entity's default value
+            seat = seat, // seat is SeatWithVersion, which extends BaseSeat
+            userId = userId,
+            reservationTime = LocalDateTime.now()
         )
-
-        // 4. Save the reservation record to the database.
         return reservationRepository.save(reservation)
     }
 
@@ -55,17 +52,40 @@ class ReservationService(
      */
     @Transactional
     fun reserveSeatWithPessimisticLock(seatId: Long, userId: String): Reservation {
-        // 1. Find the seat using Pessimistic Lock
-        val seat = seatRepository.findByIdWithPessimisticLock(seatId) // Use the locking method
-            .orElseThrow { NoSuchElementException("해당 좌석을 찾을 수 없습니다. ID: $seatId") }
+        // Uses pessimistic lock query from SeatWithVersionRepository
+        val seat = seatWithVersionRepository.findByIdWithPessimisticLock(seatId)
+            .orElseThrow { NoSuchElementException("Seat not found with ID: $seatId") }
 
-        // 2. Check availability and mark as reserved. (Protected by lock)
+        // reserve() method in SeatWithVersion includes version in exception message
         seat.reserve()
+        // seatWithVersionRepository.save(seat) // Save is cascaded or handled by dirty checking
 
-        // 3. Create the reservation record.
-        val reservation = Reservation(seat = seat, userId = userId)
-
-        // 4. Save the reservation record.
+        val reservation = Reservation(
+            seat = seat, // seat is SeatWithVersion, which extends BaseSeat
+            userId = userId,
+            reservationTime = LocalDateTime.now()
+        )
         return reservationRepository.save(reservation)
     }
+
+    // New method for the No Control scenario using SeatWithoutVersion
+    @Transactional
+    fun reserveSeatNoControl(seatId: Long, userId: String): Reservation {
+        val seat = seatWithoutVersionRepository.findById(seatId)
+             .orElseThrow { NoSuchElementException("SeatWithoutVersion not found with ID: $seatId") }
+
+        // reserve() method in SeatWithoutVersion (inherited from BaseSeat) does NOT include version
+        seat.reserve()
+        // seatWithoutVersionRepository.save(seat) // Save is cascaded or handled by dirty checking
+
+        val reservation = Reservation(
+            seat = seat, // seat is SeatWithoutVersion, which extends BaseSeat
+            userId = userId,
+            reservationTime = LocalDateTime.now()
+        )
+        // This save might cause DataIntegrityViolationException due to unique constraint on reservations.seat_id
+        return reservationRepository.save(reservation)
+    }
+
+    // Consider adding cancelReservation methods if needed, handling both entity types
 } 

@@ -16,9 +16,9 @@ class Event(
     val eventDateTime: LocalDateTime,
 
     @OneToMany(mappedBy = "event", cascade = [CascadeType.ALL], orphanRemoval = true, fetch = FetchType.LAZY) // Lazy loading 추천
-    val seats: MutableList<Seat> = mutableListOf()
+    val seats: MutableList<BaseSeat> = mutableListOf()
 ) {
-    fun addSeat(seat: Seat) {
+    fun addSeat(seat: BaseSeat) {
         seats.add(seat)
         seat.event = this
     }

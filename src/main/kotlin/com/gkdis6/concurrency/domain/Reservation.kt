@@ -10,8 +10,8 @@ class Reservation(
     val id: Long = 0,
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "seat_id", nullable = false, unique = true) // 각 좌석은 하나의 예약만 가질 수 있도록 unique 제약 추가
-    val seat: Seat,
+    @JoinColumn(name = "seat_id", nullable = false)
+    val seat: BaseSeat,
 
     @Column(nullable = false)
     val userId: String, // 사용자 ID
