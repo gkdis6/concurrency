@@ -23,6 +23,8 @@ import java.time.LocalDateTime
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import org.springframework.jdbc.core.JdbcTemplate // Import JdbcTemplate
+import org.h2.jdbc.JdbcSQLIntegrityConstraintViolationException // Import for H2 specific exception check
 
 @SpringBootTest // Use SpringBootTest for integration testing
 class ReservationServiceConcurrencyTest {
@@ -44,6 +46,9 @@ class ReservationServiceConcurrencyTest {
 
     @Autowired
     private lateinit var reservationRepository: ReservationRepository
+
+    @Autowired
+    private lateinit var jdbcTemplate: JdbcTemplate // Autowire JdbcTemplate
 
     @BeforeEach
     fun setUp() {
@@ -340,5 +345,107 @@ class ReservationServiceConcurrencyTest {
         assertThat(failedDueToOptimisticLock.get())
             .withFailMessage("[Optimistic Lock] 낙관적 락 실패가 발생해야 합니다.")
             .isGreaterThan(0)
+    }
+
+    @Test
+    @DisplayName("[DB 제약 조건] 동시 예약 시도 시 DB Unique Constraint로 인해 1건만 성공해야 함")
+    fun `reserveSeat_concurrency_rely_on_db_constraint_should_fail`() {
+        // Define constraint name (consistent usage)
+        val constraintName = "uk_reservations_seat_id"
+
+        try {
+            // === GIVEN (Setup within try block for proper cleanup) ===
+            log.info("--- [SETUP - DB Constraint] Adding unique constraint: $constraintName ---")
+            jdbcTemplate.execute("ALTER TABLE reservations ADD CONSTRAINT $constraintName UNIQUE (seat_id)")
+
+            val event = eventRepository.save(Event(name = "Test Event - DB Constraint", eventDateTime = LocalDateTime.now().plusDays(1)))
+            val seat = seatWithoutVersionRepository.save(SeatWithoutVersion(event = event, seatNumber = "A1-DB"))
+            val seatId = seat.id
+            val threadCount = 100
+            val executorService = Executors.newFixedThreadPool(32)
+            val latch = CountDownLatch(threadCount)
+
+            val successCount = AtomicInteger(0)
+            val failedDueToConflict = AtomicInteger(0)
+            val failedDueToDbConstraint = AtomicInteger(0)
+            val failedDueToOther = AtomicInteger(0)
+
+            log.info("--- [SETUP - DB Constraint] Event ID: ${event.id}, Seat ID: $seatId (SeatWithoutVersion) ---")
+            log.info("--- [TEST START - DB Constraint] Concurrency test for Seat ID: $seatId ---")
+
+            // === WHEN ===
+            for (i in 1..threadCount) {
+                executorService.submit {
+                    val userId = "user-db-constraint-$i"
+                    try {
+                        log.info("[DB Constraint] Attempting reservation for $userId on Seat $seatId")
+                        reservationService.reserveSeatNoControl(seatId, userId)
+                        successCount.incrementAndGet()
+                        log.info("[DB Constraint] SUCCESS for $userId")
+                    } catch (e: AlreadyReservedException) {
+                        failedDueToConflict.incrementAndGet()
+                        log.warn("[DB Constraint] FAILED for $userId (Conflict - Already Reserved - LESS LIKELY): ${e.message}")
+                    } catch (e: DataIntegrityViolationException) {
+                        failedDueToDbConstraint.incrementAndGet()
+                        log.warn("[DB Constraint] FAILED for $userId (DB Constraint Violation - EXPECTED): ${e.message}")
+                    } catch (e: ObjectOptimisticLockingFailureException) {
+                        failedDueToOther.incrementAndGet()
+                        log.error("[DB Constraint] FAILED for $userId (Other - UNEXPECTED): ObjectOptimisticLockingFailureException", e)
+                    } catch (e: Exception) {
+                        var cause = e.cause
+                        var isDbConstraintEx = false
+                        while (cause != null) {
+                            if (cause is JdbcSQLIntegrityConstraintViolationException || cause.message?.contains(constraintName, ignoreCase = true) == true) {
+                               isDbConstraintEx = true
+                               break
+                            }
+                            cause = cause.cause
+                        }
+                        if(isDbConstraintEx) {
+                             failedDueToDbConstraint.incrementAndGet()
+                             log.warn("[DB Constraint] FAILED for $userId (DB Constraint Violation - Wrapped - EXPECTED): ${e.message}")
+                        } else {
+                            failedDueToOther.incrementAndGet()
+                            log.error("[DB Constraint] FAILED for $userId (Other - UNEXPECTED): ${e::class.simpleName}", e)
+                        }
+                    } finally {
+                        latch.countDown()
+                    }
+                }
+            }
+
+            latch.await()
+            executorService.shutdown()
+
+            log.info("--- [TEST END - DB Constraint] Concurrency Test Finished ---")
+            log.info("--- [DB Constraint] Results ---:")
+            log.info("  Successes                     : ${successCount.get()}")
+            log.info("  Failures (Conflict)           : ${failedDueToConflict.get()}")
+            log.info("  Failures (DB Constraint)      : ${failedDueToDbConstraint.get()}")
+            log.info("  Failures (Other)            : ${failedDueToOther.get()}")
+
+            // === THEN ===
+            val finalSeat = seatWithoutVersionRepository.findById(seatId).orElse(null)
+            val reservations = reservationRepository.findAll().filter { it.seat.id == seatId }
+
+            log.info("--- [DB Constraint] Final DB State ---:")
+            log.info("  Seat ID $seatId Reserved Status : ${finalSeat?.reserved}")
+            log.info("  Reservations in DB for Seat $seatId: ${reservations.size}")
+
+            assertThat(successCount.get()).isEqualTo(1)
+            assertThat(reservations.size).isEqualTo(1)
+            assertThat(failedDueToDbConstraint.get()).isGreaterThan(0)
+            assertThat(failedDueToConflict.get() + failedDueToOther.get() + failedDueToDbConstraint.get()).isEqualTo(threadCount - 1)
+            assertThat(finalSeat?.reserved).isTrue()
+
+        } finally {
+            // === CLEANUP (Always drop constraint) ===
+            log.info("--- [CLEANUP - DB Constraint] Dropping unique constraint: $constraintName ---")
+            try {
+                 jdbcTemplate.execute("ALTER TABLE reservations DROP CONSTRAINT $constraintName")
+            } catch (e: Exception) {
+                 log.error("Failed to drop constraint $constraintName, might not have been created or already dropped: ${e.message}")
+            }
+        }
     }
 } 
