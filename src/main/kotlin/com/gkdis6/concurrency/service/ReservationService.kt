@@ -52,16 +52,16 @@ class ReservationService(
      */
     @Transactional
     fun reserveSeatWithPessimisticLock(seatId: Long, userId: String): Reservation {
-        // Uses pessimistic lock query from SeatWithVersionRepository
-        val seat = seatWithVersionRepository.findByIdWithPessimisticLock(seatId)
-            .orElseThrow { NoSuchElementException("Seat not found with ID: $seatId") }
+        // Use SeatWithoutVersionRepository with pessimistic lock
+        val seat = seatWithoutVersionRepository.findByIdWithPessimisticLock(seatId)
+            .orElseThrow { NoSuchElementException("SeatWithoutVersion not found with ID: $seatId") }
 
-        // reserve() method in SeatWithVersion includes version in exception message
+        // reserve() method from BaseSeat (no version check)
         seat.reserve()
-        // seatWithVersionRepository.save(seat) // Save is cascaded or handled by dirty checking
+        // Save is cascaded or handled by dirty checking
 
         val reservation = Reservation(
-            seat = seat, // seat is SeatWithVersion, which extends BaseSeat
+            seat = seat, // seat is SeatWithoutVersion
             userId = userId,
             reservationTime = LocalDateTime.now()
         )

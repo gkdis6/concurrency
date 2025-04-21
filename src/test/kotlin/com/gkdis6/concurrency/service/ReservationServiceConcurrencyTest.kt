@@ -139,26 +139,18 @@ class ReservationServiceConcurrencyTest {
     }
 
     @Test
-    @DisplayName("[비관적 락] 동시 예약 시도 시 1건만 성공하고 DB 제약조건 위반 없음 (SeatWithVersion)")
+    @DisplayName("[비관적 락] 동시 예약 시도 시 1건만 성공하고 DB 제약조건 위반 없음 (SeatWithoutVersion 사용)")
     fun `reserveSeat_concurrency_pessimistic_lock_should_succeed`() {
-        // 1. Save Event first
+        // Given: Use SeatWithoutVersion for this test
         val event = eventRepository.save(Event(name = "Pessimistic Lock Test Event", eventDateTime = LocalDateTime.now().plusDays(1)))
+        var seatEntity = SeatWithoutVersion(event = event, seatNumber = "A1-Pessimistic-NoVersion") // Use SeatWithoutVersion
+        seatEntity = seatWithoutVersionRepository.save(seatEntity) // Save using the correct repository
 
-        // 2. Create Seat WITH the saved Event
-        var seatEntity = SeatWithVersion(event = event, seatNumber = "A1-Pessimistic")
-
-        // 3. Save Seat (now has valid event_id)
-        seatEntity = seatWithVersionRepository.save(seatEntity)
-
-        // 4. (Optional but good practice) Update Event's collection and save/flush Event
-        // event.addSeat(seatEntity)
-        // eventRepository.saveAndFlush(event)
-
-        val testSeatId = seatEntity.id // ID should now be non-zero
+        val testSeatId = seatEntity.id
         assertThat(testSeatId).isNotNull()
-        log.info("--- [SETUP - Pessimistic Lock] Event ID: {}, Seat ID: {} (SeatWithVersion) --- ", event.id, testSeatId)
+        log.info("--- [SETUP - Pessimistic Lock] Event ID: {}, Seat ID: {} (SeatWithoutVersion) --- ", event.id, testSeatId)
 
-        val fetchedSeatBefore = seatWithVersionRepository.findById(testSeatId)
+        val fetchedSeatBefore = seatWithoutVersionRepository.findById(testSeatId) // Fetch using the correct repository
         assertThat(fetchedSeatBefore).isPresent
         assertThat(fetchedSeatBefore.get().id).isEqualTo(testSeatId)
         log.info("Checked: Successfully fetched Seat ID {} before starting concurrent threads.", testSeatId)
@@ -175,6 +167,7 @@ class ReservationServiceConcurrencyTest {
 
         log.info("--- [TEST START - Pessimistic Lock] Concurrency test for Seat ID: {} ---", testSeatId)
 
+        // When: Call the modified service method
         for (i in 1..numberOfThreads) {
             executorService.submit {
                 val userId = "user-lock-$i"
@@ -183,7 +176,7 @@ class ReservationServiceConcurrencyTest {
                     reservationService.reserveSeatWithPessimisticLock(testSeatId, userId)
                     successfulReservations.incrementAndGet()
                     log.info("[Pessimistic Lock] SUCCESS for {}", userId)
-                } catch (e: IllegalStateException) {
+                } catch (e: IllegalStateException) { // Catching IllegalStateException now (includes AlreadyReservedException)
                     log.warn("[Pessimistic Lock] FAILED for {} (Conflict - Already Reserved): {}", userId, e.message)
                     failedDueToConflict.incrementAndGet()
                 } catch (e: DataIntegrityViolationException) {
@@ -214,18 +207,19 @@ class ReservationServiceConcurrencyTest {
         log.info("  Failures (Locking)          : {}", failedDueToLocking.get())
         log.info("  Failures (Other)            : {}", otherFailures.get())
 
-        val finalSeat = seatWithVersionRepository.findById(testSeatId).orElseThrow()
+        // Then: Verify final state using SeatWithoutVersionRepository
+        val finalSeat = seatWithoutVersionRepository.findById(testSeatId).orElseThrow()
         val reservationsInDb = reservationRepository.findAll().filter { it.seat.id == testSeatId }
 
         log.info("--- [Pessimistic Lock] Final DB State ---:")
         log.info("  Seat ID {} Reserved Status : {}", testSeatId, finalSeat.reserved)
-        log.info("  Seat ID {} Final Version    : {}", testSeatId, finalSeat.version)
+        // log.info("  Seat ID {} Final Version    : {}", testSeatId, finalSeat.version) // Version info removed
         log.info("  Reservations in DB for Seat {}: {}", testSeatId, reservationsInDb.size)
 
         assertThat(successfulReservations.get()).isEqualTo(1)
         assertThat(reservationsInDb.size).isEqualTo(1)
         assertThat(finalSeat.reserved).isTrue()
-        assertThat(finalSeat.version).isEqualTo(1L)
+        // assertThat(finalSeat.version).isEqualTo(1L) // Version check removed
         assertThat(failedDueToConflict.get()).isEqualTo(numberOfThreads - 1)
         assertThat(failedDueToDbConstraint.get()).isEqualTo(0)
         assertThat(failedDueToLocking.get()).isEqualTo(0)
